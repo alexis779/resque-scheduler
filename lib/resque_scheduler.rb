@@ -6,6 +6,8 @@ require 'resque_scheduler/plugin'
 
 module ResqueScheduler
 
+  MAX_ATTEMPT = 3
+
   #
   # Accepts a new schedule configuration of the form:
   #
@@ -155,13 +157,18 @@ module ResqueScheduler
   # Insertion if O(log(n)).
   # Returns true if it's the first job to be scheduled at that time, else false
   def delayed_push(timestamp, item)
+    timestamp = timestamp.to_i
+    job_hash = encode(item)
+
     # First add this item to the list for this timestamp
-    redis.rpush("delayed:#{timestamp.to_i}", encode(item))
+    redis.rpush("delayed:#{timestamp}", job_hash)
 
     # Now, add this timestamp to the zsets.  The score and the value are
     # the same since we'll be querying by timestamp, and we don't have
     # anything else to store.
-    redis.zadd :delayed_queue_schedule, timestamp.to_i, timestamp.to_i
+    redis.zadd :delayed_queue_schedule, timestamp, timestamp
+
+    append(job_hash, timestamp)
   end
 
   # Returns an array of timestamps based on start and count
@@ -203,10 +210,11 @@ module ResqueScheduler
   def next_item_for_timestamp(timestamp)
     key = "delayed:#{timestamp.to_i}"
 
-    item = decode redis.lpop(key)
+    job_hash = redis.lpop(key)
+    item = decode job_hash
 
     # If the list is empty, remove it.
-    clean_up_timestamp(key, timestamp)
+    clean_up_timestamp(key, timestamp, job_hash)
     item
   end
 
@@ -220,16 +228,23 @@ module ResqueScheduler
   end
 
   # Given an encoded item, remove it from the delayed_queue
-  #
-  # This method is potentially very expensive since it needs to scan
-  # through the delayed queue for every timestamp, but at least it
-  # doesn't kill Redis by calling redis.keys.
   def remove_delayed(klass, *args)
     destroyed = 0
-    search = encode(job_to_hash(klass, args))
-    Array(redis.zrange(:delayed_queue_schedule, 0, -1)).each do |timestamp|
-      destroyed += redis.lrem "delayed:#{timestamp}", 0, search
+    job_hash = encode(job_to_hash(klass, args))
+
+    # get timestamps associated to job
+    timestamps = redis.hget(:delayed_queue_jobs, job_hash)
+    unless timestamps.nil?
+      timestamps = decode(timestamps)
+      destroyed = timestamps.size
+
+      timestamps.each { |timestamp|
+        key = "delayed:%d" % timestamp
+        redis.lrem key, 1, job_hash
+        clean_up_timestamp(key, timestamp, job_hash)
+      }
     end
+
     destroyed
   end
 
@@ -240,8 +255,9 @@ module ResqueScheduler
   # timestamp
   def remove_delayed_job_from_timestamp(timestamp, klass, *args)
     key = "delayed:#{timestamp.to_i}"
-    count = redis.lrem key, 0, encode(job_to_hash(klass, args))
-    clean_up_timestamp(key, timestamp)
+    job_hash = encode(job_to_hash(klass, args))
+    count = redis.lrem key, 0, job_hash
+    clean_up_timestamp(key, timestamp, job_hash)
     count
   end
 
@@ -263,16 +279,94 @@ module ResqueScheduler
       {:class => klass.to_s, :args => args, :queue => queue}
     end
 
-    def clean_up_timestamp(key, timestamp)
+    # Append timestamp element in job_hash timestamp list
+    def append(job_hash, timestamp)
+      #puts "appending %s %s" % [job_hash, timestamp]
+      monitor = "resque:lock:%s" % job_hash
+      executed = false
+      n = 0
+      until executed or n == MAX_ATTEMPT
+        n += 1
+        redis.watch monitor
+
+        # index timestamp by job hash to speed up job cancellation
+        timestamps = redis.hget :delayed_queue_jobs, job_hash
+        if timestamps.nil?
+          timestamps = []
+        else
+          timestamps = decode(timestamps)
+        end
+
+        timestamps << timestamp
+        timestamps = encode(timestamps)
+        executed = redis.multi {
+          redis.set monitor, Process.pid
+          redis.hset :delayed_queue_jobs, job_hash, timestamps
+          redis.del monitor
+        }
+      end
+      unless executed
+        puts "Max attempt reached appending %s %s" % [job_hash, timestamp]
+      end
+    end
+
+    # Keep retrying transaction with optimistic locking
+    # Remove timestamp element from job_hash timestamp list
+    # We make sure we execute the multi block successful before exiting the loop
+    # We guarantee that multi block between WATCH and MULTI EXEC be executed atomically
+    def remove(job_hash, timestamp)
+      #puts "removing %s %s" % [job_hash, timestamp]
+      monitor = "resque:lock:%s" % job_hash
+      executed = false
+      n = 0
+      until executed or n == MAX_ATTEMPT
+        n += 1
+        redis.watch monitor
+        timestamps = redis.hget :delayed_queue_jobs, job_hash
+        if timestamps.nil?
+          executed = true
+        else
+          timestamps = decode(timestamps)
+          # delete all occurences of timestamp
+          timestamps.delete(timestamp)
+
+          if timestamps.empty?
+            executed = redis.multi do
+              redis.set monitor, Process.pid
+              redis.hdel :delayed_queue_jobs, job_hash
+              redis.del monitor
+            end
+          else
+            timestamps = encode(timestamps)
+            executed = redis.multi do
+              redis.set monitor, Process.pid
+              redis.hset :delayed_queue_jobs, job_hash, timestamps
+              redis.del monitor
+            end
+          end
+        end
+      end
+      unless executed
+        puts "Max attempt reached removing %s %s" % [job_hash, timestamp]
+      end
+    end
+
+    def clean_up_timestamp(key, timestamp, job_hash)
+      timestamp = timestamp.to_i
       # If the list is empty, remove it.
+
+      # update list of timestamps belonging to the job
+      remove(job_hash, timestamp)
 
       # Use a watch here to ensure nobody adds jobs to this delayed
       # queue while we're removing it.
       redis.watch key
+
       if 0 == redis.llen(key).to_i
+        # timestamp list is empty
         redis.multi do
           redis.del key
-          redis.zrem :delayed_queue_schedule, timestamp.to_i
+          redis.zrem :delayed_queue_schedule, timestamp
         end
       else
         redis.unwatch
