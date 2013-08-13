@@ -228,22 +228,23 @@ module ResqueScheduler
   end
 
   # Given an encoded item, remove it from the delayed_queue
+  # @return Fixnum  the number of scheduled executions of the job that were removed
   def remove_delayed(klass, *args)
-    destroyed = 0
     job_hash = encode(job_to_hash(klass, args))
 
     # get timestamps associated to job
-    timestamps = redis.hget(:delayed_queue_jobs, job_hash)
-    unless timestamps.nil?
-      timestamps = decode(timestamps)
-      destroyed = timestamps.size
+    # 1 list per job indexes the timestamps when the job got scheduled for
+    key = timestamps_key(job_hash)
+    timestamps = redis.lrange(key, 0, -1)
 
-      timestamps.each { |timestamp|
-        key = "delayed:%d" % timestamp
-        redis.lrem key, 1, job_hash
-        clean_up_timestamp(key, timestamp, job_hash)
-      }
-    end
+    destroyed = timestamps.size
+
+    timestamps.each { |timestamp|
+      # 1 list per timestamp indexes the jobs scheduled at this timestamp
+      key = jobs_key(timestamp)
+      redis.lrem key, 1, job_hash
+      clean_up_timestamp(key, timestamp, job_hash)
+    }
 
     destroyed
   end
@@ -279,76 +280,14 @@ module ResqueScheduler
       {:class => klass.to_s, :args => args, :queue => queue}
     end
 
-    # Append timestamp element in job_hash timestamp list
     def append(job_hash, timestamp)
-      #puts "appending %s %s" % [job_hash, timestamp]
-      monitor = "resque:lock:%s" % job_hash
-      executed = false
-      n = 0
-      until executed or n == MAX_ATTEMPT
-        n += 1
-        redis.watch monitor
-
-        # index timestamp by job hash to speed up job cancellation
-        timestamps = redis.hget :delayed_queue_jobs, job_hash
-        if timestamps.nil?
-          timestamps = []
-        else
-          timestamps = decode(timestamps)
-        end
-
-        timestamps << timestamp
-        timestamps = encode(timestamps)
-        executed = redis.multi {
-          redis.set monitor, Process.pid
-          redis.hset :delayed_queue_jobs, job_hash, timestamps
-          redis.del monitor
-        }
-      end
-      unless executed
-        puts "Max attempt reached appending %s %s" % [job_hash, timestamp]
-      end
+      key = timestamps_key(job_hash)
+      redis.rpush(key, timestamp)
     end
 
-    # Keep retrying transaction with optimistic locking
-    # Remove timestamp element from job_hash timestamp list
-    # We make sure we execute the multi block successful before exiting the loop
-    # We guarantee that multi block between WATCH and MULTI EXEC be executed atomically
     def remove(job_hash, timestamp)
-      #puts "removing %s %s" % [job_hash, timestamp]
-      monitor = "resque:lock:%s" % job_hash
-      executed = false
-      n = 0
-      until executed or n == MAX_ATTEMPT
-        n += 1
-        redis.watch monitor
-        timestamps = redis.hget :delayed_queue_jobs, job_hash
-        if timestamps.nil?
-          executed = true
-        else
-          timestamps = decode(timestamps)
-          # delete all occurences of timestamp
-          timestamps.delete(timestamp)
-
-          if timestamps.empty?
-            executed = redis.multi do
-              redis.set monitor, Process.pid
-              redis.hdel :delayed_queue_jobs, job_hash
-              redis.del monitor
-            end
-          else
-            timestamps = encode(timestamps)
-            executed = redis.multi do
-              redis.set monitor, Process.pid
-              redis.hset :delayed_queue_jobs, job_hash, timestamps
-              redis.del monitor
-            end
-          end
-        end
-      end
-      unless executed
-        puts "Max attempt reached removing %s %s" % [job_hash, timestamp]
-      end
+      key = timestamps_key(job_hash)
+      redis.lrem(key, timestamp, 0)
     end
 
     def clean_up_timestamp(key, timestamp, job_hash)
@@ -393,6 +332,13 @@ module ResqueScheduler
       prepared_hash
     end
 
+    def timestamps_key(job_hash)
+      "timestamps:%s" % job_hash
+    end
+
+    def jobs_key(timestamp)
+      "delayed:%d" % timestamp
+    end
 end
 
 Resque.extend ResqueScheduler

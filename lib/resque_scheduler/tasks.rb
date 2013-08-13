@@ -34,4 +34,17 @@ namespace :resque do
     end
   end
 
+  desc "Generate reverted index to fetch timestamps associated to jobs"
+  task :migrate do
+    redis = Resque.redis
+    redis.zrange("resque:delayed_queue_schedule", 0, -1).each { |timestamp|
+      timestamp = timestamp.to_i
+      key = "resque:delayed:%d" % timestamp
+      redis.lrange(key, 0, -1).each { |job_hash|
+        key = "resque:timestamps:%s" % job_hash
+        redis.rpush(key, timestamp)
+      }
+    }
+  end
+
 end
