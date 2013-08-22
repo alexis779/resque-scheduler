@@ -237,8 +237,6 @@ module ResqueScheduler
     key = timestamps_key(job_hash)
     timestamps = redis.lrange(key, 0, -1)
 
-    destroyed = timestamps.size
-
     timestamps.each { |timestamp|
       # 1 list per timestamp indexes the jobs scheduled at this timestamp
       key = jobs_key(timestamp)
@@ -246,7 +244,7 @@ module ResqueScheduler
       clean_up_timestamp(key, timestamp, job_hash)
     }
 
-    destroyed
+    timestamps.size
   end
 
   # Given a timestamp and job (klass + args) it removes all instances and
@@ -287,7 +285,7 @@ module ResqueScheduler
 
     def remove(job_hash, timestamp)
       key = timestamps_key(job_hash)
-      redis.lrem(key, timestamp, 0)
+      redis.lrem(key, 0, timestamp)
     end
 
     def clean_up_timestamp(key, timestamp, job_hash)
